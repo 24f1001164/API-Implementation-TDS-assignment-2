@@ -1,108 +1,124 @@
-import time
-import uuid
-import base64
-from collections import defaultdict, deque
+import re
+from datetime import datetime
+from dateutil.parser import parse
 
-from fastapi import FastAPI, Header, HTTPException, Response
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 from pydantic import BaseModel
-
-TOTAL_ORDERS = 49
-RATE_LIMIT = 17
-WINDOW = 10  # seconds
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# -----------------------------
-# In-memory storage
-# -----------------------------
-orders_created = {}
-client_requests = defaultdict(deque)
+class InvoiceRequest(BaseModel):
+    text: str
 
 
-class OrderRequest(BaseModel):
-    item: str = "default"
+class InvoiceResponse(BaseModel):
+    vendor: str
+    amount: float
+    currency: str
+    date: str
 
 
-# -----------------------------------
-# Rate Limiter
-# -----------------------------------
-def check_rate_limit(client_id: str, response: Response):
-    now = time.time()
-
-    bucket = client_requests[client_id]
-
-    while bucket and bucket[0] <= now - WINDOW:
-        bucket.popleft()
-
-    if len(bucket) >= RATE_LIMIT:
-        retry_after = int(WINDOW - (now - bucket[0])) + 1
-        response.headers["Retry-After"] = str(retry_after)
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
-
-    bucket.append(now)
+CURRENCIES = ["USD", "EUR", "GBP"]
 
 
-# -----------------------------------
-# POST /orders
-# -----------------------------------
-@app.post("/orders", status_code=201)
-def create_order(
-    order: OrderRequest,
-    response: Response,
-    idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    x_client_id: str = Header("default", alias="X-Client-Id"),
-):
-    check_rate_limit(x_client_id, response)
+def extract_vendor(text: str):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-    if idempotency_key in orders_created:
-        return orders_created[idempotency_key]
+    # Look for Vendor:
+    for line in lines:
+        m = re.search(r"Vendor[:\-]?\s*(.+)", line, re.I)
+        if m:
+            return m.group(1).strip()
 
-    new_order = {
-        "id": str(uuid.uuid4()),
-        "item": order.item,
-    }
+    # Ignore invoice-related lines
+    ignore = [
+        "invoice",
+        "amount",
+        "total",
+        "due",
+        "currency",
+        "date",
+        "payment",
+    ]
 
-    orders_created[idempotency_key] = new_order
+    for line in lines:
+        low = line.lower()
+        if not any(x in low for x in ignore):
+            return line.strip()
 
-    return new_order
+    return ""
 
 
-# -----------------------------------
-# GET /orders
-# -----------------------------------
-@app.get("/orders")
-def list_orders(
-    limit: int = 10,
-    cursor: str | None = None,
-    response: Response = None,
-    x_client_id: str = Header("default", alias="X-Client-Id"),
-):
-    check_rate_limit(x_client_id, response)
+def extract_amount(text: str):
+    patterns = [
+        r"Total(?: Due)?[: ]+\$?([0-9]+(?:\.[0-9]{1,2})?)",
+        r"Amount(?: Due)?[: ]+\$?([0-9]+(?:\.[0-9]{1,2})?)",
+        r"Due[: ]+\$?([0-9]+(?:\.[0-9]{1,2})?)",
+        r"\$([0-9]+(?:\.[0-9]{1,2})?)",
+    ]
 
-    if cursor:
-        start = int(base64.b64decode(cursor).decode())
-    else:
-        start = 1
+    for p in patterns:
+        m = re.search(p, text, re.I)
+        if m:
+            return float(m.group(1))
 
-    end = min(start + limit - 1, TOTAL_ORDERS)
+    nums = re.findall(r"\b\d+(?:\.\d+)?\b", text)
+    if nums:
+        return float(max(nums, key=float))
 
-    items = [{"id": i} for i in range(start, end + 1)]
+    return 0.0
 
-    next_cursor = None
 
-    if end < TOTAL_ORDERS:
-        next_cursor = base64.b64encode(str(end + 1).encode()).decode()
+def extract_currency(text: str):
+    m = re.search(r"\b(USD|EUR|GBP)\b", text, re.I)
+    if m:
+        return m.group(1).upper()
 
-    return {
-        "items": items,
-        "next_cursor": next_cursor,
-    }
+    if "$" in text:
+        return "USD"
+
+    return ""
+
+
+def extract_date(text: str):
+    # Already ISO
+    m = re.search(r"(2026-\d{2}-\d{2})", text)
+    if m:
+        return m.group(1)
+
+    # General date parser
+    candidates = re.findall(
+        r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|[A-Za-z]+ +\d{1,2}, +\d{4})",
+        text,
+    )
+
+    for c in candidates:
+        try:
+            d = parse(c, fuzzy=True)
+            return d.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    return ""
+
+
+@app.post("/extract", response_model=InvoiceResponse)
+def extract(req: InvoiceRequest):
+
+    text = req.text.strip()
+
+    if not text:
+        return InvoiceResponse(
+            vendor="",
+            amount=0,
+            currency="",
+            date=""
+        )
+
+    return InvoiceResponse(
+        vendor=extract_vendor(text),
+        amount=extract_amount(text),
+        currency=extract_currency(text),
+        date=extract_date(text),
+    )
